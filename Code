@@ -1,0 +1,519 @@
+library(Seurat)
+library(ggplot2)
+library(harmony)
+library(Matrix)
+library(gridExtra)
+library(scales)
+library(cowplot)
+library(RCurl)
+library(ggrepel)
+
+#getting data location
+
+dirs = list.dirs(path = '/Users/sartaki/Documents/data/',recursive = F, full.names = F)
+
+dirs
+
+
+#for extracting data and making seurat objects
+
+#in each iteration, files are fetched to produce counts matrix
+
+#then seurat object is made which has patient information and type of tissue
+
+#data considered for this exp are raw_feature_bc_matrix
+
+
+# Initialize a list to store Seurat objects
+seurat_objects <- list()
+
+# Iterate over directories and create Seurat objects
+for (x in dirs) {
+  # Read the matrix, features, and barcodes
+  cts <- ReadMtx(mtx = paste0("/Users/sartaki/Documents/data/", x, "/matrix.mtx.gz"),
+                 features = paste0("/Users/sartaki/Documents/data/", x, "/features.tsv.gz"),
+                 cells = paste0("/Users/sartaki/Documents/data/", x, "/barcodes.tsv.gz"))
+  
+  # Add file name prefix to cell barcodes
+  colnames(cts) <- paste0(x, "_", colnames(cts))
+  
+  # Create a Seurat object and store it in the list
+  seurat_objects[[x]] <- CreateSeuratObject(counts = cts)
+}
+
+
+
+# Merge all Seurat objects with cell ID prefixes already set
+cancer_patients_all <- Reduce(function(x, y) merge(x, y = y, project = "cancer_patients_all"),
+                              seurat_objects)
+
+# Check the resulting object
+print(cancer_patients_all)  
+View(cancer_patients_all@meta.data)
+
+#33538 features across 51835 samples
+
+#creating a sample column
+
+cancer_patients_all$sample = rownames(cancer_patients_all@meta.data)
+
+View(cancer_patients_all@meta.data)
+
+
+
+#separating elements of sample column
+library(tidyr)
+cancer_patients_all@meta.data = separate(cancer_patients_all@meta.data, col = "sample", into = c("Patient","Type","Barcode"),sep = "_")
+
+View(cancer_patients_all@meta.data)
+
+#to see if merged data contains data from all patients and different tissue types
+
+unique(cancer_patients_all@meta.data$Patient)
+
+unique(cancer_patients_all@meta.data$Type)
+
+
+
+
+##################### formal QC############################
+cancer_patients_all$mitoPercent = PercentageFeatureSet(cancer_patients_all, pattern = "^MT-")
+
+pre_filtering_QC_violinplot = VlnPlot(cancer_patients_all, features = c("nFeature_RNA", "nCount_RNA", "mitoPercent"), ncol = 3,raster = FALSE)
+
+pre_filtering_QC_violinplot
+
+ggsave("pre_filtering_QC_violin_plot_nGene_nUMI_mitopercent.png",pre_filtering_QC_violinplot, width = 7, height = 5,
+       
+       path = "/Users/sartaki/Documents/1.QC")
+
+pre_filtering_QC_scatterplot = FeatureScatter(cancer_patients_all, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",raster = FALSE) +
+  
+  geom_smooth(method = "lm")
+
+pre_filtering_QC_scatterplot
+
+ggsave("pre-filtering_QC_featurescatterplot_nGene_vs_nUMI.png",pre_filtering_QC_scatterplot, width = 7, height = 5,
+       
+       path = "/Users/sartaki/Documents/1.QC")
+
+
+
+
+
+#####filtering parameters####
+
+cancer_patients_all_filtered <- subset(
+  x = cancer_patients_all,
+  subset = (nCount_RNA >= 200) &  # Cells with at least 200 UMIs
+    (nFeature_RNA >= 3) & # Genes expressed in at least 3 cells
+    (mitoPercent < 25)    # Mitochondrial gene content < 25%
+)
+
+
+cancer_patients_all_filtered
+
+
+### formal QC###
+
+post_filtering_QC_violinplot = VlnPlot(cancer_patients_all_filtered, features =c("nFeature_RNA", "nCount_RNA", "mitoPercent"), ncol = 3,raster = FALSE)
+
+post_filtering_QC_violinplot
+
+ggsave("post_filtering_QC_violin_plot_nGene_nUMI_mitopercent.png",post_filtering_QC_violinplot, width = 7, height = 5,
+       
+       path = "/Users/sartaki/Documents/1.QC")
+
+post_filtering_QC_scatterplot = FeatureScatter(cancer_patients_all_filtered, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",raster = FALSE) +
+  
+  geom_smooth(method = "lm")
+
+post_filtering_QC_scatterplot
+
+ggsave("post_filtering_QC_featurescatterplot_nGene_vs_nUMI.png",post_filtering_QC_scatterplot, width = 7, height = 5,
+       
+       path = "/Users/sartaki/Documents/1.QC")
+
+
+
+
+
+####standard workflow steps####
+
+#data normalization
+
+cancer_patients_all_filtered = NormalizeData(object = cancer_patients_all_filtered)
+
+#to identify highly variable features
+
+cancer_patients_all_filtered = FindVariableFeatures(object = cancer_patients_all_filtered)
+
+#scaling data
+
+cancer_patients_all_filtered = ScaleData(object = cancer_patients_all_filtered)
+
+#running linear dimensionality reduction- PCA- by default for 2000 features but can be modified
+
+cancer_patients_all_filtered = RunPCA(object = cancer_patients_all_filtered)
+
+#elbow plot made after this for determining dimesionality- we use all 20 as experience from past scripts
+
+#running UMAP- non-linear dimensionality reduction
+
+cancer_patients_all_filtered = RunUMAP(object = cancer_patients_all_filtered, dims = 1:20, reduction = "pca")
+
+###data visualization in plot###
+
+
+p1 = DimPlot(cancer_patients_all_filtered, reduction = "umap", group.by = "Patient")
+
+p2 = DimPlot(cancer_patients_all_filtered, reduction = "umap", group.by = "Type")
+
+pre_int_UMAP_data_visualization = p1|p2
+
+pre_int_UMAP_data_visualization
+
+ggsave("UMAP_post_filtering_pre-int_plot.png",pre_int_UMAP_data_visualization, width = 10, height = 5,
+       
+       path = "/Users/sartaki/Documents/2.UMAP_before_integration/")
+
+
+#####Harmony integration- across patient#####
+
+cancer_patients_all_integrated = cancer_patients_all_filtered %>% RunHarmony(group.by.vars = "Patient", plot_convergence = FALSE)
+
+
+
+#to look at harmony object
+
+#to use harmony reduction- run UMAP and clustering using this harmony reduction
+
+cancer_patients_all_integrated@reductions
+
+
+
+#to obtain embedding
+
+cancer_patients_all_integrated_embedding = Embeddings(cancer_patients_all_integrated, "harmony")
+
+View(cancer_patients_all_integrated_embedding)
+
+
+
+#using Harmony embedding for UMAP and clustering
+
+cancer_patients_all_integrated = cancer_patients_all_integrated %>% RunUMAP(reduction = "harmony", dims = 1:20) %>% FindNeighbors(reduction = "harmony", dims = 1:20) %>% FindClusters(resolution = c(0.05,0.1,0.15,0.2,0.25,0.3))
+
+View(cancer_patients_all_integrated@meta.data)
+
+
+#using UMAP here because, these UMAP reductions are calculated using Harmony reductions
+
+
+
+p3 = DimPlot(cancer_patients_all_integrated, reduction = "umap", group.by = "Patient")
+
+p4 = DimPlot(cancer_patients_all_integrated, reduction = "umap", group.by = "Type")
+
+post_int_UMAP_data_visualization = p3|p4
+
+post_int_UMAP_data_visualization
+
+ggsave("UMAP_post_int_plot.png",post_int_UMAP_data_visualization, width = 10, height = 5,
+       
+       path = "/Users/sartaki/Documents/3.UMAP_post_integration_harmony_by_patient/")
+
+
+
+clusterplot_0.3 = DimPlot(cancer_patients_all_integrated, group.by = "seurat_clusters", label = TRUE,split.by = "Type")
+
+clusterplot_0.3
+
+ggsave("clusterplot_0.3.png",clusterplot_0.3, width = 10, height = 5,
+       
+       path = "/Users/sartaki/Documents/5.cluster_by_Patient/")
+
+
+#####findallmarkers_int_by_patients#####
+
+#Proceeding for cell identification with resolution 0.3. 
+
+
+#res0.3
+
+cancer_patients_all_integrated = JoinLayers(cancer_patients_all_integrated)
+
+findallmarkers_res0.3 <- FindAllMarkers(object = cancer_patients_all_integrated,
+                                        
+                                        only.pos = TRUE,min.pct = 0.5,
+                                        
+                                        logfc.threshold = log(2), min.diff.pct = 0.25, max.cells.per.ident = 200)
+View(findallmarkers_res0.3)
+write.csv(findallmarkers_res0.3, "/Users/sartaki/Documents/findallmarkers_res0.3.csv", row.names = FALSE)
+
+#reordering columns for more intuitiveness
+
+reorder_findallmarkers_res0.3 = findallmarkers_res0.3 %>% dplyr::select("cluster", everything()) %>% dplyr::select("gene", everything())
+
+View(reorder_findallmarkers_res0.3)
+write.csv(reorder_findallmarkers_res0.3, "/Users/sartaki/Documents/reorder_findallmarkers_res0.3.csv", row.names = FALSE)
+
+#ordering rows by p-adj values
+library(dplyr)
+
+
+reorder_findallmarkers_res0.3 = reorder_findallmarkers_res0.3 %>% dplyr::arrange(cluster,p_val_adj)
+
+View(reorder_findallmarkers_res0.3)
+
+top5_markers_res0.3 = reorder_findallmarkers_res0.3 %>% group_by(cluster) %>% top_n(n=5, wt = avg_log2FC)
+
+View(top5_markers_res0.3)
+
+
+top5markers_dotplot_0.3 = DotPlot(
+  cancer_patients_all_integrated,
+  assay = NULL,
+  features = top5_markers_res0.3$gene,
+  cols = c("blue", "red"),
+  col.min = 0,
+  col.max = 2.5,
+  dot.min = 0,
+  dot.scale = 6,
+  idents = NULL,
+  group.by = NULL,
+  split.by = NULL,
+  cluster.idents = FALSE,
+  scale = TRUE,
+  scale.by = "radius",
+  scale.min = NA,
+  scale.max = NA
+) + 
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 6),  # Reduce size here
+    axis.text.y = element_text(size = 6)  # Reduce size here
+  )
+
+top5markers_dotplot_0.3 = top5markers_dotplot_0.3 + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1,size = 8), axis.text.y = element_text(size = 12) )
+
+ggsave("top5markers_dotplot_0.3.png",top5markers_dotplot_0.3, width = 10, height = 5,path = "/Users/sartaki/Documents/7.cluster_markers/")
+
+top5markers_dotplot_0.3
+
+
+#####Assigning cell identifications to clusters####
+Idents(cancer_patients_all_integrated)
+
+cancer_all_integrated_ident_cluster  <- RenameIdents(object =  cancer_patients_all_integrated  ,
+                                                     "0" = "CD8+ T cell",
+                                                     "1" = "Follicular B cell",
+                                                     "2" = "Central memory T cell",
+                                                     "3" = "Germ cell",
+                                                     "4" = "Endothelial",
+                                                     "5" = "Monocyte",
+                                                     "6" = "NK cells",
+                                                     "7" = "Cholangiocytes",
+                                                     "8" = "plasma B",
+                                                     "9" = "CSC-like",
+                                                     "10" = "Goblet like",
+                                                     "11" = "Isthmus cell",
+                                                     "12"= "Fibroblast", 
+                                                     "13"= "Enterocyte",
+                                                     "14"= "Goblet",
+                                                     "15" = "B cell",
+                                                     "16" = "Epithelial",
+                                                     "17" = "Basal",
+                                                     "18" ="Erythroid-like")
+table(Idents(cancer_patients_all_integrated))
+
+Idents( cancer_all_integrated_ident_cluster)
+table(Idents(cancer_all_integrated_ident_cluster))
+
+#making plot with cell idents- markers and dimplot
+cellident_dimplot = DimPlot( cancer_all_integrated_ident_cluster, label = TRUE)
+cellident_dimplot
+ggsave(" cancer_all_integrated_ident_cluster  .png",cellident_dimplot, width = 12, height = 7,
+       path = "/Users/sartaki/Documents/8.cluster__markers/")
+
+top5_markers_with_identified_clusters = DotPlot(
+  cancer_all_integrated_ident_cluster,
+  assay = NULL,
+  features = top5_markers_res0.3$gene,
+  cols = c("blue", "red"),
+  col.min = -2.5,
+  col.max = 2.5,
+  dot.min = 0,
+  dot.scale = 6,
+  idents = NULL,
+  group.by = NULL,
+  split.by = NULL,
+  cluster.idents = FALSE,
+  scale = TRUE,
+  scale.by = "radius",
+  scale.min = NA,
+  scale.max = NA
+) + 
+  theme(
+    axis.text.x = element_text(size = 8),  # Reduce x-axis text size
+    axis.text.y = element_text(size = 8),  # Reduce y-axis text size for feature names
+    axis.title = element_text(size = 10),  # Reduce axis title size
+    strip.text.y = element_text(size = 5)  # Reduce feature label size if in facet strips
+  )
+
+
+top5_markers_with_identified_clusters = top5_markers_with_identified_clusters + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1,size = 6.5), axis.text.y = element_text(size = 12) )
+ggsave("top5_markers_with_identified_clusters.png",top5_markers_with_identified_clusters, width = 10, height = 5,path = "/Users/sartaki/Documents/8.dot_plot_clusters/")
+top5_markers_with_identified_clusters
+
+
+#adding a column of cell idents to the meta data
+
+cancer_all_integrated_ident_cluster  $cellident = NA
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 0] <- "CD8+ T"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 1] <- "follicular B"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 2] <- "central memory T cell"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 3] <- "Germ cell"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 4] <- "Endothelial"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 5] <- "Monocyte"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 6] <- "NK cells"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 7] <- "Cholangiocytes"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 8] <- "plasma B"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 9] <- "csc-like"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 10] <- "Goblet-like"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 11] <- "Isthmus cell"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 12] <- "Fibroblast"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 13] <- "Enterocytes"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 14] <- "Goblet"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 15] <- "B cell"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 16] <- "Epithelial"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 17] <- "Basal cell"
+cancer_all_integrated_ident_cluster  $cellident[ cancer_all_integrated_ident_cluster  $seurat_clusters == 18] <- "Erythroid-like"
+
+View( cancer_all_integrated_ident_cluster  @meta.data)
+
+#saving merged_seurat5_harmony_patient.identcluster as seurat object
+saveRDS( cancer_all_integrated_ident_cluster  , file = "../seurat_objects/ cancer_all_integrated_ident_cluster  .RData")
+
+# Check all cluster identities in the Seurat object
+levels(Idents(cancer_all_integrated_ident_cluster))
+
+
+##### DEG analysis#####
+#findmarkers-
+
+#findallmarkers- following parameters of filtering were used for obtaining cell specific markers
+findallmarkers_res0.3 <- FindAllMarkers(object =  cancer_all_integrated_ident_cluster  ,
+                                        only.pos = TRUE,min.pct = 0.5,
+                                        logfc.threshold = log(2), min.diff.pct = 0.25, max.cells.per.ident = 200) 
+
+View(findallmarkers_res0.3)
+
+# Select top 50 markers based on avg_log2FC from all clusters combined
+Top_markers <- findallmarkers_res0.3 %>%
+  slice_max(order_by = avg_log2FC, n = 50)
+
+
+top50_DEGs = DotPlot(
+  cancer_all_integrated_ident_cluster,
+  assay = NULL,
+  features = Top_markers$gene,
+  cols = c("blue", "red"),
+  col.min = -2.5,
+  col.max = 2.5,
+  dot.min = 0,
+  dot.scale = 6,
+  idents = NULL,
+  group.by = NULL,
+  split.by = NULL,
+  cluster.idents = FALSE,
+  scale = TRUE,
+  scale.by = "radius",
+  scale.min = NA,
+  scale.max = NA
+) + 
+  theme(
+    axis.text.x = element_text(size = 8),  # Reduce x-axis text size
+    axis.text.y = element_text(size = 8),  # Reduce y-axis text size for feature names
+    axis.title = element_text(size = 10),  # Reduce axis title size
+    strip.text.y = element_text(size = 5)  # Reduce feature label size if in facet strips
+  )
+
+top50_DEGs = top5_DEGs + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1,size = 6.5), axis.text.y = element_text(size = 12) )
+
+top50_DEGs
+
+
+################compare###########
+
+
+adenoma_vs_carcinoma <- FindMarkers(
+  object = cancer_all_integrated_ident_cluster,
+  ident.1 = "A",
+  ident.2 = "C",
+  group.by = "Type",
+  min.pct = 0.25,
+  logfc.threshold = log(1.5),
+  test.use = "wilcox" # Default Wilcoxon test
+)
+
+Normal_vs_carcinoma <- FindMarkers(
+  object = cancer_all_integrated_ident_cluster,
+  ident.1 = "N",
+  ident.2 = "C",
+  group.by = "Type",
+  min.pct = 0.25,
+  logfc.threshold = log(1.5),
+  test.use = "wilcox" # Default Wilcoxon test
+)
+
+Adenoma_vs_Normal <- FindMarkers(
+  object = cancer_all_integrated_ident_cluster,
+  ident.1 = "A",
+  ident.2 = "N",
+  group.by = "Type",
+  min.pct = 0.25,
+  logfc.threshold = log(1.5),
+  test.use = "wilcox" # Default Wilcoxon test
+)
+
+##################plot##########################
+
+library(EnhancedVolcano)
+
+EnhancedVolcano(
+  adenoma_vs_carcinoma,
+  lab = rownames(adenoma_vs_carcinoma),
+  x = 'avg_log2FC',
+  y = 'p_val_adj',
+  title = 'adenoma vs carcinoma',
+  pCutoff = 0.05,
+  FCcutoff = 1.5,
+  pointSize = 2.0,
+  labSize = 3.5
+)
+
+EnhancedVolcano(
+  Normal_vs_carcinoma,
+  lab = rownames(Normal_vs_carcinoma),
+  x = 'avg_log2FC',
+  y = 'p_val_adj',
+  title = 'Normal vs carcinoma',
+  pCutoff = 0.05,
+  FCcutoff = 1.5,
+  pointSize = 2.0,
+  labSize = 3.5
+)
+
+
+
+EnhancedVolcano(
+  Adenoma_vs_Normal,
+  lab = rownames(Adenoma_vs_Normal),
+  x = 'avg_log2FC',
+  y = 'p_val_adj',
+  title = 'Adenoma vs Normal',
+  pCutoff = 0.05,
+  FCcutoff = 1.5,
+  pointSize = 2.0,
+  labSize = 3.5
+)
